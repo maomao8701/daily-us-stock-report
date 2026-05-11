@@ -1,7 +1,7 @@
 import json
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import feedparser
@@ -55,6 +55,38 @@ def fetch_quotes():
 
     return quotes
 
+
+
+def market_status_message(quotes):
+    now = datetime.now(ZoneInfo("Asia/Shanghai"))
+    today = now.date()
+
+    # 北京时间周二到周六早上 8 点，才对应美股前一晚正常收盘。
+    # 周日、周一早上没有新的美股收盘数据。
+    if now.weekday() not in [1, 2, 3, 4, 5]:
+        return (
+            False,
+            f"【美股情报简报｜{today.isoformat()}｜美股休市】\n\n"
+            "昨晚美股休市，没有新的收盘数据。\n"
+            "- 今日不生成大盘、AI、ETF 和资金配置详情。\n"
+            "- 下一次正常交易日收盘后再更新完整日报。"
+        )
+
+    expected_market_date = (today - timedelta(days=1)).isoformat()
+    latest_market_date = quotes["标普500"]["last_date"]
+
+    if latest_market_date != expected_market_date:
+        return (
+            False,
+            f"【美股情报简报｜{today.isoformat()}｜美股休市】\n\n"
+            "昨晚美股休市，或收盘数据尚未更新。\n"
+            f"- 预期收盘日期：{expected_market_date}\n"
+            f"- 当前最新可得收盘日期：{latest_market_date}\n"
+            "- 今日不生成大盘、AI、ETF 和资金配置详情。\n"
+            "- 下一次正常交易日收盘后再更新完整日报。"
+        )
+
+    return True, None
 
 def fetch_news():
     urls = [
@@ -243,6 +275,13 @@ def send_feishu(text):
 
 def main():
     quotes = fetch_quotes()
+
+    market_open,休市_message = market_status_message(quotes)
+    if not market_open:
+        print(休市_message)
+        send_feishu(休市_message)
+        return
+
     news = fetch_news()
     pf = portfolio(quotes)
     report = generate_report(quotes, news, pf)
