@@ -377,15 +377,16 @@ def send_pending():
         send_feishu({"msg_type": "text", "content": {"text": f"{title}\n\n{content}\n\n完整报告：{url}"}})
 
 
-def build_report():
+def build_report(force=False):
     quotes, history = fetch_market_data()
-    holiday = market_status_message(quotes)
+    holiday = None if force else market_status_message(quotes)
     if holiday:
         DOCS_DIR.mkdir(parents=True, exist_ok=True)
         index = DOCS_DIR / "index.html"
         if not index.exists():
             index.write_text("<!doctype html><meta charset=\"utf-8\"><title>美股情报简报</title><body><h1>美股情报简报</h1><p>暂无交易日报，下一次正常交易日收盘后更新。</p></body>", encoding="utf-8")
             (DOCS_DIR / ".nojekyll").touch()
+        print(holiday)
         write_pending({"msg_type": "text", "content": {"text": holiday}})
         return
     report_date = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
@@ -396,16 +397,18 @@ def build_report():
     cleanup_history(date.fromisoformat(report_date))
     render_html(report_date, quotes, pf, analysis, DOCS_DIR / "reports" / f"{report_date}.html")
     write_pending(summary_card(report_date, analysis, f"{BASE_URL}/reports/{report_date}.html"))
+    print(f"Generated HTML report for {report_date}")
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--send-pending", action="store_true")
+    parser.add_argument("--force-report", action="store_true")
     args = parser.parse_args()
     if args.send_pending:
         send_pending()
     else:
-        build_report()
+        build_report(force=args.force_report)
 
 
 if __name__ == "__main__":
