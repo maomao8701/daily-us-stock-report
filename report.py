@@ -34,6 +34,7 @@ HOLDINGS = {
     "QQQ": {"shares": 0.0, "avg_cost": 0.0},
 }
 TARGET_VALUES = {"VOO": 1800, "QQQ": 750, "VXUS": 450}
+TRADES = []
 CHART_LABELS = {"标普500": "S&P 500", "道指": "Dow", "纳指": "Nasdaq", "NVDA": "NVDA", "QQQ": "QQQ", "VOO": "VOO", "VXUS": "VXUS"}
 BASE_URL = "https://maomao8701.github.io/daily-us-stock-report"
 DOCS_DIR = Path("docs")
@@ -219,20 +220,44 @@ def generate_analysis(quotes, news, pf):
     return json.loads(response.output_text)
 
 
-def normalized_series(history, names):
+
+def save_etf_chart(history, output):
+    names = ["VOO", "VXUS", "QQQ"]
     dates = sorted(set.intersection(*(set(history[name]) for name in names)))
-    return dates, {name: [history[name][day] / history[name][dates[0]] * 100 for day in dates] for name in names}
+    fig, ax = plt.subplots(figsize=(10.5, 5.2), dpi=170)
 
+    for name in names:
+        values = [history[name][day] for day in dates]
+        ax.plot(dates, values, linewidth=2.3, label=name)
 
-def save_line_chart(history, names, output, title):
-    dates, series = normalized_series(history, names)
-    fig, ax = plt.subplots(figsize=(10, 4.8), dpi=160)
-    for name, values in series.items():
-        ax.plot(dates, values, linewidth=2.2, label=CHART_LABELS.get(name, name))
-    ax.set_title(title)
-    ax.set_ylabel("First day = 100")
+    for symbol, holding in HOLDINGS.items():
+        if holding["shares"] <= 0:
+            continue
+        avg_cost = holding["avg_cost"]
+        ax.axhline(avg_cost, linestyle="--", linewidth=1.6, alpha=0.72, label=f"{symbol} cost ${avg_cost:.2f}")
+
+    for trade in TRADES:
+        symbol = trade["symbol"]
+        trade_date = trade["date"]
+        if symbol not in names or trade_date not in history[symbol]:
+            continue
+        marker = "^" if trade["side"] == "buy" else "v"
+        color = "#15803d" if trade["side"] == "buy" else "#b91c1c"
+        ax.scatter([trade_date], [history[symbol][trade_date]], marker=marker, s=90, color=color, zorder=5)
+        ax.annotate(
+            f"{trade['side'].upper()} {symbol}",
+            xy=(trade_date, history[symbol][trade_date]),
+            xytext=(0, 12 if trade["side"] == "buy" else -18),
+            textcoords="offset points",
+            ha="center",
+            fontsize=8,
+            color=color,
+        )
+
+    ax.set_title("ETF prices with cost basis: last 30 trading days")
+    ax.set_ylabel("Price (USD)")
     ax.grid(alpha=0.22)
-    ax.legend(frameon=False, ncol=min(3, len(names)))
+    ax.legend(frameon=False, ncol=2)
     ax.tick_params(axis="x", rotation=45)
     for label in ax.get_xticklabels():
         label.set_horizontalalignment("right")
@@ -241,42 +266,11 @@ def save_line_chart(history, names, output, title):
     plt.close(fig)
 
 
-def save_bar_chart(labels, series, output, title, ylabel):
-    fig, ax = plt.subplots(figsize=(8, 4.6), dpi=160)
-    width = 0.36
-    positions = list(range(len(labels)))
-    if len(series) == 1:
-        values = next(iter(series.values()))
-        colors = ["#177ddc" if value >= 0 else "#cf1322" for value in values]
-        ax.bar(labels, values, color=colors)
-    else:
-        for index, (name, values) in enumerate(series.items()):
-            shifted = [value + (index - 0.5) * width for value in positions]
-            ax.bar(shifted, values, width=width, label=name)
-        ax.set_xticks(positions, labels)
-        ax.legend(frameon=False)
-    ax.set_title(title)
-    ax.set_ylabel(ylabel)
-    ax.grid(axis="y", alpha=0.22)
-    fig.tight_layout()
-    fig.savefig(output, bbox_inches="tight")
-    plt.close(fig)
-
-
 def generate_charts(history, pf, chart_dir):
+    if chart_dir.exists():
+        shutil.rmtree(chart_dir)
     chart_dir.mkdir(parents=True, exist_ok=True)
-    save_line_chart(history, ["标普500", "道指", "纳指"], chart_dir / "indices.png", "Major indexes: last 30 trading days")
-    save_line_chart(history, ["NVDA", "QQQ"], chart_dir / "ai.png", "AI / tech: last 30 trading days")
-    save_line_chart(history, ["VOO", "VXUS", "QQQ"], chart_dir / "etfs.png", "ETFs: last 30 trading days")
-    labels = ["VOO", "QQQ", "VXUS"]
-    save_bar_chart(labels, {
-        "Current": [pf["holdings"][item]["current_value"] for item in labels],
-        "Target": [TARGET_VALUES[item] for item in labels],
-    }, chart_dir / "allocation.png", "Current ETF value vs target", "USD")
-    save_bar_chart(labels, {
-        "P/L": [pf["holdings"][item]["pnl_amount"] or 0 for item in labels],
-    }, chart_dir / "pnl.png", "Current holding P/L", "USD")
-
+    save_etf_chart(history, chart_dir / "etfs.png")
 
 def esc(value):
     return html.escape(str(value))
@@ -303,7 +297,7 @@ def render_html(report_date, quotes, pf, analysis, report_path):
     action_items = "".join(f"<li><b>{label}</b>：{esc(actions[key])}</li>" for key, label in [("VOO", "VOO"), ("VXUS", "VXUS"), ("QQQ", "QQQ"), ("new_funds", "新资金"), ("take_profit", "止盈提醒")])
     metrics = "".join(f'<div class="metric">{name}<b>{fmt_price(quotes[name]["close"])}</b><span>{fmt_pct(quotes[name]["change_pct"])}</span></div>' for name in ["标普500", "道指", "纳指"])
     ai_metrics = "".join(f'<div class="metric">{name}<b>{fmt_price(quotes[name]["close"])}</b><span>{fmt_pct(quotes[name]["change_pct"])}</span></div>' for name in ["NVDA", "QQQ"])
-    charts = "".join(f'<figure><img src="{chart_prefix}/{name}.png" alt="{esc(alt)}"></figure>' for name, alt in [("indices", "主要指数走势"), ("ai", "AI科技走势"), ("etfs", "ETF走势"), ("allocation", "组合配置"), ("pnl", "持仓盈亏")])
+    charts = f'<figure class="wide-chart"><img src="{chart_prefix}/etfs.png" alt="ETF 走势与成本线"></figure>'
     page = f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>美股情报简报｜{report_date}</title><style>
 :root{{--ink:#172033;--muted:#64748b;--line:#e2e8f0;--soft:#f6f8fb;--blue:#1769aa;--green:#15803d}}*{{box-sizing:border-box}}
@@ -311,7 +305,7 @@ body{{margin:0;background:#f3f6f9;color:var(--ink);font:15px/1.65 -apple-system,
 main{{max-width:1080px;margin:auto;background:white;min-height:100vh;padding:28px}}h1{{margin:0;font-size:28px}}h2{{margin:28px 0 12px;border-bottom:1px solid var(--line);padding-bottom:8px;font-size:20px}}
 .meta{{color:var(--muted)}}.metrics,.holdings,.charts{{display:grid;gap:14px}}.metrics{{grid-template-columns:repeat(3,1fr)}}.holdings{{grid-template-columns:repeat(3,1fr)}}
 .metric,.holding,.note{{border:1px solid var(--line);border-radius:6px;padding:14px;background:#fff}}.metric b{{display:block;font-size:21px}}h3{{margin:0 0 9px}}h3 span{{float:right;color:var(--blue)}}
-dl{{display:grid;grid-template-columns:auto 1fr;gap:2px 10px;margin:0}}dt{{color:var(--muted)}}dd{{margin:0;text-align:right}}.charts{{grid-template-columns:repeat(2,1fr)}}figure{{margin:0;border:1px solid var(--line);padding:9px;border-radius:6px}}img{{width:100%;height:auto;display:block}}
+dl{{display:grid;grid-template-columns:auto 1fr;gap:2px 10px;margin:0}}dt{{color:var(--muted)}}dd{{margin:0;text-align:right}}.charts{{grid-template-columns:1fr}}figure{{margin:0;border:1px solid var(--line);padding:9px;border-radius:6px}}img{{width:100%;height:auto;display:block}}
 .signal{{border-left:4px solid var(--green);background:#f0fdf4;padding:12px 15px}}.history a{{display:inline-block;margin:0 9px 7px 0}}ul{{padding-left:20px}}
 @media(max-width:760px){{main{{padding:18px}}h1{{font-size:23px}}.metrics,.holdings,.charts{{grid-template-columns:1fr}}}}
 </style></head><body><main><header><h1>美股情报简报</h1><div class="meta">{report_date}｜昨晚收盘</div></header>
@@ -322,7 +316,7 @@ dl{{display:grid;grid-template-columns:auto 1fr;gap:2px 10px;margin:0}}dt{{color
 <h2>资金配置提醒</h2><div class="metrics"><div class="metric">目标组合<b>VOO 60%</b><span>QQQ 25% / VXUS 15%</span></div><div class="metric">当前已投入<b>${pf["invested"]:.2f}</b><span>计划总资金 $3000</span></div><div class="metric">组合浮盈亏<b>{fmt_usd(pf["total_pnl"])}</b><span>当前市值 ${pf["market_value"]:.2f}</span></div></div>
 <p class="signal"><b>当前强买入信号：</b>{esc(analysis["strong_buy_signal"])}<br><b>当前可执行信号：</b>{esc(analysis["executable_signal"])}</p>
 <h2>下一笔优先级</h2><ol>{priorities}</ol><h2>今日动作</h2><ul>{action_items}</ul>
-<h2>图表</h2><div class="charts">{charts}</div>
+<h2>ETF 走势与成本线</h2><div class="charts">{charts}</div>
 <h2>历史日报</h2><nav class="history">{history_links()}</nav></main></body></html>'''
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(page, encoding="utf-8")
