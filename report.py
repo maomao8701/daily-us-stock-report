@@ -34,7 +34,11 @@ HOLDINGS = {
     "QQQ": {"shares": 0.0, "avg_cost": 0.0},
 }
 TARGET_VALUES = {"VOO": 1800, "QQQ": 750, "VXUS": 450}
-TRADES = []
+TRADES = [
+    {"date": "2026-04-06", "symbol": "VOO", "side": "buy", "shares": 0.10, "price": 603.66},
+    {"date": "2026-05-05", "symbol": "VOO", "side": "buy", "shares": 0.30, "price": 663.54},
+    {"date": "2026-05-05", "symbol": "VXUS", "side": "buy", "shares": 3.00, "price": 83.11},
+]
 CHART_LABELS = {"标普500": "S&P 500", "道指": "Dow", "纳指": "Nasdaq", "NVDA": "NVDA", "QQQ": "QQQ", "VOO": "VOO", "VXUS": "VXUS"}
 BASE_URL = "https://maomao8701.github.io/daily-us-stock-report"
 DOCS_DIR = Path("docs")
@@ -120,7 +124,7 @@ def fetch_market_data():
     quotes = {}
     history = {}
     for name, symbol in TICKERS.items():
-        frame = raw[symbol].dropna(subset=["Close"]).tail(30)
+        frame = raw[symbol].dropna(subset=["Close"])
         if len(frame) < 2:
             raise RuntimeError(f"{symbol} 可用收盘数据不足")
         closes = frame["Close"]
@@ -224,43 +228,43 @@ def generate_analysis(quotes, news, pf):
 def save_etf_chart(history, output):
     names = ["VOO", "VXUS", "QQQ"]
     dates = sorted(set.intersection(*(set(history[name]) for name in names)))
-    fig, ax = plt.subplots(figsize=(10.5, 5.2), dpi=170)
+    fig, axes = plt.subplots(len(names), 1, figsize=(10.5, 8.0), dpi=170, sharex=True)
 
-    for name in names:
+    for ax, name in zip(axes, names):
         values = [history[name][day] for day in dates]
-        ax.plot(dates, values, linewidth=2.3, label=name)
+        ax.plot(dates, values, linewidth=2.3, label=f"{name} close")
 
-    for symbol, holding in HOLDINGS.items():
-        if holding["shares"] <= 0:
-            continue
-        avg_cost = holding["avg_cost"]
-        ax.axhline(avg_cost, linestyle="--", linewidth=1.6, alpha=0.72, label=f"{symbol} cost ${avg_cost:.2f}")
+        holding = HOLDINGS[name]
+        if holding["shares"] > 0:
+            avg_cost = holding["avg_cost"]
+            ax.axhline(avg_cost, linestyle="--", linewidth=1.5, alpha=0.72, color="#64748b", label=f"avg cost ${avg_cost:.2f}")
 
-    for trade in TRADES:
-        symbol = trade["symbol"]
-        trade_date = trade["date"]
-        if symbol not in names or trade_date not in history[symbol]:
-            continue
-        marker = "^" if trade["side"] == "buy" else "v"
-        color = "#15803d" if trade["side"] == "buy" else "#b91c1c"
-        ax.scatter([trade_date], [history[symbol][trade_date]], marker=marker, s=90, color=color, zorder=5)
-        ax.annotate(
-            f"{trade['side'].upper()} {symbol}",
-            xy=(trade_date, history[symbol][trade_date]),
-            xytext=(0, 12 if trade["side"] == "buy" else -18),
-            textcoords="offset points",
-            ha="center",
-            fontsize=8,
-            color=color,
-        )
+        for trade in TRADES:
+            if trade["symbol"] != name or trade["date"] not in history[name]:
+                continue
+            marker = "^" if trade["side"] == "buy" else "v"
+            color = "#15803d" if trade["side"] == "buy" else "#b91c1c"
+            y_value = trade.get("price", history[name][trade["date"]])
+            ax.scatter([trade["date"]], [y_value], marker=marker, s=95, color=color, zorder=5)
+            ax.annotate(
+                f"{trade['side'].upper()} {trade['shares']:g} @${y_value:.2f}",
+                xy=(trade["date"], y_value),
+                xytext=(0, 12 if trade["side"] == "buy" else -18),
+                textcoords="offset points",
+                ha="center",
+                fontsize=8,
+                color=color,
+            )
 
-    ax.set_title("ETF prices with cost basis: last 30 trading days")
-    ax.set_ylabel("Price (USD)")
-    ax.grid(alpha=0.22)
-    ax.legend(frameon=False, ncol=2)
-    ax.tick_params(axis="x", rotation=45)
-    for label in ax.get_xticklabels():
+        ax.set_title(name, loc="left", fontweight="bold")
+        ax.set_ylabel("USD")
+        ax.grid(alpha=0.22)
+        ax.legend(frameon=False, loc="upper left", ncol=2)
+
+    axes[-1].tick_params(axis="x", rotation=45)
+    for label in axes[-1].get_xticklabels():
         label.set_horizontalalignment("right")
+    fig.suptitle("ETF prices with buy points and cost basis", y=0.995)
     fig.tight_layout()
     fig.savefig(output, bbox_inches="tight")
     plt.close(fig)
