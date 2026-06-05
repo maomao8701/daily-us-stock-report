@@ -1,13 +1,23 @@
+import argparse
+import html
 import json
 import os
+import shutil
 import sys
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import feedparser
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+
+import matplotlib
 import requests
 import yfinance as yf
 from openai import OpenAI
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 TICKERS = {
     "标普500": "^GSPC",
@@ -18,280 +28,395 @@ TICKERS = {
     "VOO": "VOO",
     "VXUS": "VXUS",
 }
-
 HOLDINGS = {
     "VOO": {"shares": 0.4, "avg_cost": 648.57},
     "VXUS": {"shares": 3.0, "avg_cost": 83.11},
     "QQQ": {"shares": 0.0, "avg_cost": 0.0},
 }
+TARGET_VALUES = {"VOO": 1800, "QQQ": 750, "VXUS": 450}
+CHART_LABELS = {"标普500": "S&P 500", "道指": "Dow", "纳指": "Nasdaq", "NVDA": "NVDA", "QQQ": "QQQ", "VOO": "VOO", "VXUS": "VXUS"}
+BASE_URL = "https://maomao8701.github.io/daily-us-stock-report"
+DOCS_DIR = Path("docs")
+PENDING_MESSAGE = Path(".pending-feishu-message.json")
+REPORT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "market_conclusion": {"type": "string"},
+        "ai_conclusion": {"type": "string"},
+        "macro_points": {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 2},
+        "macro_conclusion": {"type": "string"},
+        "etf_judgements": {
+            "type": "object",
+            "properties": {symbol: {"type": "string"} for symbol in HOLDINGS},
+            "required": list(HOLDINGS),
+            "additionalProperties": False,
+        },
+        "strong_buy_signal": {"type": "string"},
+        "executable_signal": {"type": "string"},
+        "next_priorities": {
+            "type": "object",
+            "properties": {symbol: {"type": "string"} for symbol in HOLDINGS},
+            "required": list(HOLDINGS),
+            "additionalProperties": False,
+        },
+        "today_actions": {
+            "type": "object",
+            "properties": {
+                "VOO": {"type": "string"},
+                "VXUS": {"type": "string"},
+                "QQQ": {"type": "string"},
+                "new_funds": {"type": "string"},
+                "take_profit": {"type": "string"},
+            },
+            "required": ["VOO", "VXUS", "QQQ", "new_funds", "take_profit"],
+            "additionalProperties": False,
+        },
+    },
+    "required": [
+        "market_conclusion",
+        "ai_conclusion",
+        "macro_points",
+        "macro_conclusion",
+        "etf_judgements",
+        "strong_buy_signal",
+        "executable_signal",
+        "next_priorities",
+        "today_actions",
+    ],
+    "additionalProperties": False,
+}
 
-FEISHU_WEBHOOK_URL = os.environ["FEISHU_WEBHOOK_URL"]
-OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+
+def env(name):
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise RuntimeError(f"缺少环境变量 {name}")
+    return value
 
 
-def fetch_quotes():
-    data = yf.download(
+def fmt_price(value):
+    return f"{value:,.2f}"
+
+
+def fmt_pct(value):
+    return f"{value:+.2f}%"
+
+
+def fmt_usd(value):
+    return f"{value:+.2f}美元"
+
+
+def fetch_market_data():
+    raw = yf.download(
         list(TICKERS.values()),
-        period="7d",
+        period="3mo",
         interval="1d",
         group_by="ticker",
         progress=False,
         auto_adjust=False,
+        threads=True,
     )
-
     quotes = {}
+    history = {}
     for name, symbol in TICKERS.items():
-        frame = data[symbol].dropna(subset=["Close"])
-        last = frame.iloc[-1]
-        prev = frame.iloc[-2]
-        close = float(last["Close"])
-        prev_close = float(prev["Close"])
+        frame = raw[symbol].dropna(subset=["Close"]).tail(30)
+        if len(frame) < 2:
+            raise RuntimeError(f"{symbol} 可用收盘数据不足")
+        closes = frame["Close"]
+        latest = float(closes.iloc[-1])
+        previous = float(closes.iloc[-2])
         quotes[name] = {
             "symbol": symbol,
-            "close": round(close, 2),
-            "change_pct": round((close / prev_close - 1) * 100, 2),
+            "close": round(latest, 2),
+            "change_pct": round((latest / previous - 1) * 100, 2),
             "last_date": str(frame.index[-1].date()),
         }
+        history[name] = {str(index.date()): round(float(value), 4) for index, value in closes.items()}
+    return quotes, history
 
-    return quotes
 
-
-
-def market_status_message(quotes):
-    now = datetime.now(ZoneInfo("Asia/Shanghai"))
+def market_status_message(quotes, now=None):
+    now = now or datetime.now(ZoneInfo("Asia/Shanghai"))
     today = now.date()
-
-    # 北京时间周二到周六早上 8 点，才对应美股前一晚正常收盘。
-    # 周日、周一早上没有新的美股收盘数据。
     if now.weekday() not in [1, 2, 3, 4, 5]:
+        return f"【美股情报简报｜{today.isoformat()}｜美股休市】\n\n昨晚美股休市，没有新的收盘数据。"
+    expected = (today - timedelta(days=1)).isoformat()
+    latest = quotes["标普500"]["last_date"]
+    if latest != expected:
         return (
-            False,
             f"【美股情报简报｜{today.isoformat()}｜美股休市】\n\n"
-            "昨晚美股休市，没有新的收盘数据。\n"
-            "- 今日不生成大盘、AI、ETF 和资金配置详情。\n"
-            "- 下一次正常交易日收盘后再更新完整日报。"
+            f"昨晚美股休市，或收盘数据尚未更新。当前最新收盘日期：{latest}。"
         )
+    return None
 
-    expected_market_date = (today - timedelta(days=1)).isoformat()
-    latest_market_date = quotes["标普500"]["last_date"]
-
-    if latest_market_date != expected_market_date:
-        return (
-            False,
-            f"【美股情报简报｜{today.isoformat()}｜美股休市】\n\n"
-            "昨晚美股休市，或收盘数据尚未更新。\n"
-            f"- 预期收盘日期：{expected_market_date}\n"
-            f"- 当前最新可得收盘日期：{latest_market_date}\n"
-            "- 今日不生成大盘、AI、ETF 和资金配置详情。\n"
-            "- 下一次正常交易日收盘后再更新完整日报。"
-        )
-
-    return True, None
 
 def fetch_news():
     urls = [
         "https://feeds.finance.yahoo.com/rss/2.0/headline?s=%5EGSPC,%5EDJI,%5EIXIC,QQQ,NVDA,VOO,VXUS,CL=F&region=US&lang=en-US",
         "https://www.investing.com/rss/news_25.rss",
     ]
-
     items = []
     for url in urls:
         try:
             feed = feedparser.parse(url)
             for entry in feed.entries[:8]:
                 title = getattr(entry, "title", "").strip()
-                summary = getattr(entry, "summary", "").strip()
                 if title:
-                    items.append({"title": title, "summary": summary[:240]})
+                    items.append({"title": title, "summary": getattr(entry, "summary", "").strip()[:240]})
         except Exception:
             pass
-
     seen = set()
-    deduped = []
+    result = []
     for item in items:
         key = item["title"].lower()
         if key not in seen:
             seen.add(key)
-            deduped.append(item)
-
-    return deduped[:10]
+            result.append(item)
+    return result[:10]
 
 
 def portfolio(quotes):
-    invested = sum(v["shares"] * v["avg_cost"] for v in HOLDINGS.values())
-    market_value = sum(HOLDINGS[s]["shares"] * quotes[s]["close"] for s in HOLDINGS)
-    total_pnl = market_value - invested
-
+    invested = sum(item["shares"] * item["avg_cost"] for item in HOLDINGS.values())
     holdings = {}
-    for symbol, h in HOLDINGS.items():
+    for symbol, item in HOLDINGS.items():
         close = quotes[symbol]["close"]
-        shares = h["shares"]
-        avg_cost = h["avg_cost"]
-        current_value = close * shares
-        if shares > 0:
-            pnl_pct = (close / avg_cost - 1) * 100
-            pnl_amount = (close - avg_cost) * shares
-        else:
-            pnl_pct = None
-            pnl_amount = None
-
+        shares = item["shares"]
+        avg_cost = item["avg_cost"]
+        pnl_pct = None if not shares else round((close / avg_cost - 1) * 100, 2)
+        pnl_amount = None if not shares else round((close - avg_cost) * shares, 2)
         holdings[symbol] = {
-            "shares": shares,
-            "avg_cost": avg_cost,
-            "current_value": round(current_value, 2),
-            "pnl_pct": None if pnl_pct is None else round(pnl_pct, 2),
-            "pnl_amount": None if pnl_amount is None else round(pnl_amount, 2),
+            **item,
+            "current_value": round(close * shares, 2),
+            "pnl_pct": pnl_pct,
+            "pnl_amount": pnl_amount,
         }
-
+    market_value = sum(item["current_value"] for item in holdings.values())
     return {
         "target_allocation": "VOO 60% / QQQ 25% / VXUS 15%",
         "target_total_usd": 3000,
         "invested": round(invested, 2),
         "market_value": round(market_value, 2),
-        "total_pnl": round(total_pnl, 2),
+        "total_pnl": round(market_value - invested, 2),
         "holdings": holdings,
-        "target_values": {
-            "VOO": 1800,
-            "QQQ": 750,
-            "VXUS": 450,
+        "target_values": TARGET_VALUES,
+    }
+
+
+def generate_analysis(quotes, news, pf):
+    prompt = f"""你是谨慎、直接的美股个人投资助理。根据真实行情、新闻标题和个人持仓生成结构化分析。
+要求：每天结合指数结构、NVDA/QQQ 强弱、宏观新闻和持仓盈亏重新判断；避免固定套话；短句、具体、可执行；
+新闻仅根据标题谨慎判断；不要编造数据；不要承诺收益；不要使用 Markdown。
+
+行情：{json.dumps(quotes, ensure_ascii=False)}
+新闻：{json.dumps(news, ensure_ascii=False)}
+持仓：{json.dumps(pf, ensure_ascii=False)}
+"""
+    response = OpenAI(api_key=env("OPENAI_API_KEY")).responses.create(
+        model="gpt-5.4-mini",
+        input=prompt,
+        text={"format": {"type": "json_schema", "name": "stock_report", "strict": True, "schema": REPORT_SCHEMA}},
+    )
+    return json.loads(response.output_text)
+
+
+def normalized_series(history, names):
+    dates = sorted(set.intersection(*(set(history[name]) for name in names)))
+    return dates, {name: [history[name][day] / history[name][dates[0]] * 100 for day in dates] for name in names}
+
+
+def save_line_chart(history, names, output, title):
+    dates, series = normalized_series(history, names)
+    fig, ax = plt.subplots(figsize=(10, 4.8), dpi=160)
+    for name, values in series.items():
+        ax.plot(dates, values, linewidth=2.2, label=CHART_LABELS.get(name, name))
+    ax.set_title(title)
+    ax.set_ylabel("First day = 100")
+    ax.grid(alpha=0.22)
+    ax.legend(frameon=False, ncol=min(3, len(names)))
+    ax.tick_params(axis="x", rotation=45)
+    for label in ax.get_xticklabels():
+        label.set_horizontalalignment("right")
+    fig.tight_layout()
+    fig.savefig(output, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_bar_chart(labels, series, output, title, ylabel):
+    fig, ax = plt.subplots(figsize=(8, 4.6), dpi=160)
+    width = 0.36
+    positions = list(range(len(labels)))
+    if len(series) == 1:
+        values = next(iter(series.values()))
+        colors = ["#177ddc" if value >= 0 else "#cf1322" for value in values]
+        ax.bar(labels, values, color=colors)
+    else:
+        for index, (name, values) in enumerate(series.items()):
+            shifted = [value + (index - 0.5) * width for value in positions]
+            ax.bar(shifted, values, width=width, label=name)
+        ax.set_xticks(positions, labels)
+        ax.legend(frameon=False)
+    ax.set_title(title)
+    ax.set_ylabel(ylabel)
+    ax.grid(axis="y", alpha=0.22)
+    fig.tight_layout()
+    fig.savefig(output, bbox_inches="tight")
+    plt.close(fig)
+
+
+def generate_charts(history, pf, chart_dir):
+    chart_dir.mkdir(parents=True, exist_ok=True)
+    save_line_chart(history, ["标普500", "道指", "纳指"], chart_dir / "indices.png", "Major indexes: last 30 trading days")
+    save_line_chart(history, ["NVDA", "QQQ"], chart_dir / "ai.png", "AI / tech: last 30 trading days")
+    save_line_chart(history, ["VOO", "VXUS", "QQQ"], chart_dir / "etfs.png", "ETFs: last 30 trading days")
+    labels = ["VOO", "QQQ", "VXUS"]
+    save_bar_chart(labels, {
+        "Current": [pf["holdings"][item]["current_value"] for item in labels],
+        "Target": [TARGET_VALUES[item] for item in labels],
+    }, chart_dir / "allocation.png", "Current ETF value vs target", "USD")
+    save_bar_chart(labels, {
+        "P/L": [pf["holdings"][item]["pnl_amount"] or 0 for item in labels],
+    }, chart_dir / "pnl.png", "Current holding P/L", "USD")
+
+
+def esc(value):
+    return html.escape(str(value))
+
+
+def holding_html(symbol, quote, item, judgement):
+    pnl = "暂无持仓" if item["pnl_pct"] is None else f'{fmt_pct(item["pnl_pct"])} / {fmt_usd(item["pnl_amount"])}'
+    return f"""<article class="holding"><h3>{symbol}<span>${fmt_price(quote["close"])}</span></h3>
+<dl><dt>持仓</dt><dd>{item["shares"]:g} 股</dd><dt>平均成本</dt><dd>${item["avg_cost"]:.2f}</dd>
+<dt>当前市值</dt><dd>${item["current_value"]:.2f}</dd><dt>浮盈亏</dt><dd>{esc(pnl)}</dd></dl>
+<p>{esc(judgement)}</p></article>"""
+
+
+def history_links():
+    reports = sorted((DOCS_DIR / "reports").glob("*.html"), reverse=True)[:30]
+    return "".join(f'<a href="reports/{item.name}">{item.stem}</a>' for item in reports)
+
+
+def render_html(report_date, quotes, pf, analysis, report_path):
+    chart_prefix = f"assets/{report_date}"
+    actions = analysis["today_actions"]
+    holdings = "".join(holding_html(symbol, quotes[symbol], pf["holdings"][symbol], analysis["etf_judgements"][symbol]) for symbol in HOLDINGS)
+    priorities = "".join(f"<li><b>{symbol}</b>：{esc(analysis['next_priorities'][symbol])}</li>" for symbol in ["VOO", "QQQ", "VXUS"])
+    action_items = "".join(f"<li><b>{label}</b>：{esc(actions[key])}</li>" for key, label in [("VOO", "VOO"), ("VXUS", "VXUS"), ("QQQ", "QQQ"), ("new_funds", "新资金"), ("take_profit", "止盈提醒")])
+    metrics = "".join(f'<div class="metric">{name}<b>{fmt_price(quotes[name]["close"])}</b><span>{fmt_pct(quotes[name]["change_pct"])}</span></div>' for name in ["标普500", "道指", "纳指"])
+    ai_metrics = "".join(f'<div class="metric">{name}<b>{fmt_price(quotes[name]["close"])}</b><span>{fmt_pct(quotes[name]["change_pct"])}</span></div>' for name in ["NVDA", "QQQ"])
+    charts = "".join(f'<figure><img src="{chart_prefix}/{name}.png" alt="{esc(alt)}"></figure>' for name, alt in [("indices", "主要指数走势"), ("ai", "AI科技走势"), ("etfs", "ETF走势"), ("allocation", "组合配置"), ("pnl", "持仓盈亏")])
+    page = f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>美股情报简报｜{report_date}</title><style>
+:root{{--ink:#172033;--muted:#64748b;--line:#e2e8f0;--soft:#f6f8fb;--blue:#1769aa;--green:#15803d}}*{{box-sizing:border-box}}
+body{{margin:0;background:#f3f6f9;color:var(--ink);font:15px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif}}
+main{{max-width:1080px;margin:auto;background:white;min-height:100vh;padding:28px}}h1{{margin:0;font-size:28px}}h2{{margin:28px 0 12px;border-bottom:1px solid var(--line);padding-bottom:8px;font-size:20px}}
+.meta{{color:var(--muted)}}.metrics,.holdings,.charts{{display:grid;gap:14px}}.metrics{{grid-template-columns:repeat(3,1fr)}}.holdings{{grid-template-columns:repeat(3,1fr)}}
+.metric,.holding,.note{{border:1px solid var(--line);border-radius:6px;padding:14px;background:#fff}}.metric b{{display:block;font-size:21px}}h3{{margin:0 0 9px}}h3 span{{float:right;color:var(--blue)}}
+dl{{display:grid;grid-template-columns:auto 1fr;gap:2px 10px;margin:0}}dt{{color:var(--muted)}}dd{{margin:0;text-align:right}}.charts{{grid-template-columns:repeat(2,1fr)}}figure{{margin:0;border:1px solid var(--line);padding:9px;border-radius:6px}}img{{width:100%;height:auto;display:block}}
+.signal{{border-left:4px solid var(--green);background:#f0fdf4;padding:12px 15px}}.history a{{display:inline-block;margin:0 9px 7px 0}}ul{{padding-left:20px}}
+@media(max-width:760px){{main{{padding:18px}}h1{{font-size:23px}}.metrics,.holdings,.charts{{grid-template-columns:1fr}}}}
+</style></head><body><main><header><h1>美股情报简报</h1><div class="meta">{report_date}｜昨晚收盘</div></header>
+<h2>大盘</h2><div class="metrics">{metrics}</div><p>{esc(analysis["market_conclusion"])}</p>
+<h2>AI</h2><div class="metrics">{ai_metrics}</div><p>{esc(analysis["ai_conclusion"])}</p>
+<h2>宏观</h2><ul><li>{esc(analysis["macro_points"][0])}</li><li>{esc(analysis["macro_points"][1])}</li></ul><p>{esc(analysis["macro_conclusion"])}</p>
+<h2>ETF</h2><div class="holdings">{holdings}</div>
+<h2>资金配置提醒</h2><div class="metrics"><div class="metric">目标组合<b>VOO 60%</b><span>QQQ 25% / VXUS 15%</span></div><div class="metric">当前已投入<b>${pf["invested"]:.2f}</b><span>计划总资金 $3000</span></div><div class="metric">组合浮盈亏<b>{fmt_usd(pf["total_pnl"])}</b><span>当前市值 ${pf["market_value"]:.2f}</span></div></div>
+<p class="signal"><b>当前强买入信号：</b>{esc(analysis["strong_buy_signal"])}<br><b>当前可执行信号：</b>{esc(analysis["executable_signal"])}</p>
+<h2>下一笔优先级</h2><ol>{priorities}</ol><h2>今日动作</h2><ul>{action_items}</ul>
+<h2>图表</h2><div class="charts">{charts}</div>
+<h2>历史日报</h2><nav class="history">{history_links()}</nav></main></body></html>'''
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(page, encoding="utf-8")
+    (DOCS_DIR / "index.html").write_text(page, encoding="utf-8")
+    (DOCS_DIR / ".nojekyll").touch()
+
+
+def cleanup_history(today):
+    cutoff = today - timedelta(days=30)
+    reports_dir = DOCS_DIR / "reports"
+    assets_dir = DOCS_DIR / "assets"
+    for report in reports_dir.glob("*.html") if reports_dir.exists() else []:
+        if date.fromisoformat(report.stem) < cutoff:
+            report.unlink()
+    for chart_dir in assets_dir.glob("*") if assets_dir.exists() else []:
+        if chart_dir.is_dir() and date.fromisoformat(chart_dir.name) < cutoff:
+            shutil.rmtree(chart_dir)
+
+
+def write_pending(payload):
+    PENDING_MESSAGE.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+
+def summary_card(report_date, analysis, report_url):
+    actions = analysis["today_actions"]
+    action_text = "\n".join(f"- {label}：{actions[key]}" for key, label in [("VOO", "VOO"), ("VXUS", "VXUS"), ("QQQ", "QQQ"), ("new_funds", "新资金")])
+    return {
+        "msg_type": "interactive",
+        "card": {
+            "header": {"template": "blue", "title": {"tag": "plain_text", "content": f"美股情报简报｜{report_date}"}},
+            "elements": [
+                {"tag": "div", "text": {"tag": "lark_md", "content": f"**大盘结论**\n{analysis['market_conclusion']}\n\n**AI 结论**\n{analysis['ai_conclusion']}\n\n**当前强买入信号**\n{analysis['strong_buy_signal']}\n\n**今日动作**\n{action_text}"}},
+                {"tag": "action", "actions": [{"tag": "button", "text": {"tag": "plain_text", "content": "查看完整 HTML 报告"}, "url": report_url, "type": "primary"}]},
+            ],
         },
     }
 
 
-def generate_report(quotes, news, pf):
-    today = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
-    client = OpenAI(api_key=OPENAI_API_KEY)
-
-    prompt = f"""
-你是一个谨慎、直接的美股个人投资助理。请基于下面真实行情、新闻标题和持仓数据，生成中文飞书日报。
-
-重要要求：
-1. 必须严格使用下面的版式，不要增加新的栏目。
-2. 每天的“结论 / 判断 / 今日动作”必须根据当天数据重新分析，不要写固定套话。
-3. 可以保守，但要具体说明为什么，例如：指数结构、纳指强弱、NVDA/QQQ强弱、宏观新闻、持仓浮盈浮亏。
-4. 不要编造没有提供的数据。新闻只根据标题做谨慎判断。
-5. 不要承诺收益，不要写确定性预测。
-6. 语言要像真实投研备注，短句、直接、可执行。
-7. 日期使用：{today}
-8. 所有价格、涨跌幅、持仓、成本、浮盈金额必须使用输入数据，不要自己重新估算。
-9. 如果今天是周末或行情日期不是最近一个交易日，可以继续使用最新收盘数据，但在结论里说明这是最新可得收盘数据。
-
-行情数据：
-{json.dumps(quotes, ensure_ascii=False, indent=2)}
-
-新闻标题：
-{json.dumps(news, ensure_ascii=False, indent=2)}
-
-持仓与组合数据：
-{json.dumps(pf, ensure_ascii=False, indent=2)}
-
-请严格输出以下格式：
-
-【美股情报简报｜{today}｜昨晚收盘】
-
-大盘
-- 标普500：
-- 道指：
-- 纳指：
-- 结论：
-
-AI
-- 英伟达（NVDA）：
-- QQQ：
-- 结论：
-
-宏观
--
--
-- 结论：
-
-ETF
-- VOO：
-  你的持仓：
-  平均成本：
-  当前浮盈：
-  当前浮盈金额：
-  判断：
-
-- VXUS：
-  你的持仓：
-  平均成本：
-  当前浮盈：
-  当前浮盈金额：
-  判断：
-
-- QQQ：
-  你的持仓：
-  判断：
-
-资金配置提醒
-- 目标组合：VOO 60% / QQQ 25% / VXUS 15%
-- 计划账户总资金：约3000美元
-- 当前已投入：
-- 当前市值：
-- 当前组合浮盈：
-
-按3000美元目标估算：
-- VOO目标约1800美元，目前约：
-- QQQ目标约750美元，目前：
-- VXUS目标约450美元，目前约：
-
-当前强买入信号：
-当前可执行信号：
-
-下一笔优先级
-1）VOO：
-2）QQQ：
-3）VXUS：
-
-今日动作
-- VOO：
-- VXUS：
-- QQQ：
-- 新资金：
-- 止盈提醒：
-"""
-
-    response = client.responses.create(
-        model="gpt-5.4-mini",
-        input=prompt,
-    )
-
-    return response.output_text.strip()
-
-
-def send_feishu(text):
-    response = requests.post(
-        FEISHU_WEBHOOK_URL,
-        headers={"Content-Type": "application/json"},
-        data=json.dumps({"msg_type": "text", "content": {"text": text}}),
-        timeout=20,
-    )
+def send_feishu(payload):
+    response = requests.post(env("FEISHU_WEBHOOK_URL"), json=payload, timeout=20)
     response.raise_for_status()
-    body = response.json()
-    if body.get("code") != 0 and body.get("StatusCode") != 0:
-        raise RuntimeError(body)
+    result = response.json()
+    if result.get("code") != 0 and result.get("StatusCode") != 0:
+        raise RuntimeError(result)
+
+
+def send_pending():
+    payload = json.loads(PENDING_MESSAGE.read_text(encoding="utf-8"))
+    try:
+        send_feishu(payload)
+    except Exception:
+        if payload.get("msg_type") != "interactive":
+            raise
+        card = payload["card"]
+        title = card["header"]["title"]["content"]
+        content = card["elements"][0]["text"]["content"].replace("**", "")
+        url = card["elements"][1]["actions"][0]["url"]
+        send_feishu({"msg_type": "text", "content": {"text": f"{title}\n\n{content}\n\n完整报告：{url}"}})
+
+
+def build_report():
+    quotes, history = fetch_market_data()
+    holiday = market_status_message(quotes)
+    if holiday:
+        DOCS_DIR.mkdir(parents=True, exist_ok=True)
+        index = DOCS_DIR / "index.html"
+        if not index.exists():
+            index.write_text("<!doctype html><meta charset=\"utf-8\"><title>美股情报简报</title><body><h1>美股情报简报</h1><p>暂无交易日报，下一次正常交易日收盘后更新。</p></body>", encoding="utf-8")
+            (DOCS_DIR / ".nojekyll").touch()
+        write_pending({"msg_type": "text", "content": {"text": holiday}})
+        return
+    report_date = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
+    pf = portfolio(quotes)
+    analysis = generate_analysis(quotes, fetch_news(), pf)
+    chart_dir = DOCS_DIR / "assets" / report_date
+    generate_charts(history, pf, chart_dir)
+    cleanup_history(date.fromisoformat(report_date))
+    render_html(report_date, quotes, pf, analysis, DOCS_DIR / "reports" / f"{report_date}.html")
+    write_pending(summary_card(report_date, analysis, f"{BASE_URL}/reports/{report_date}.html"))
 
 
 def main():
-    quotes = fetch_quotes()
-
-    market_open,休市_message = market_status_message(quotes)
-    if not market_open:
-        print(休市_message)
-        send_feishu(休市_message)
-        return
-
-    news = fetch_news()
-    pf = portfolio(quotes)
-    report = generate_report(quotes, news, pf)
-    print(report)
-    send_feishu(report)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--send-pending", action="store_true")
+    args = parser.parse_args()
+    if args.send_pending:
+        send_pending()
+    else:
+        build_report()
 
 
 if __name__ == "__main__":
     try:
         main()
-    except Exception as e:
-        print(f"日报发送失败：{e}", file=sys.stderr)
+    except Exception as exc:
+        print(f"日报任务失败：{exc}", file=sys.stderr)
         raise
