@@ -10,15 +10,10 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import feedparser
-os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
-
-import matplotlib
 import requests
 import yfinance as yf
 from openai import OpenAI
 
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 
 TICKERS = {
     "标普500": "^GSPC",
@@ -275,56 +270,6 @@ def generate_analysis(quotes, news, pf):
 
 
 
-def save_etf_chart(history, output):
-    names = ["VOO", "VXUS", "QQQ"]
-    dates = sorted(set.intersection(*(set(history[name]) for name in names)))
-    fig, axes = plt.subplots(len(names), 1, figsize=(10.5, 8.0), dpi=170, sharex=True)
-
-    for ax, name in zip(axes, names):
-        values = [history[name][day] for day in dates]
-        ax.plot(dates, values, linewidth=2.3, label=f"{name} close")
-
-        holding = HOLDINGS[name]
-        if holding["shares"] > 0:
-            avg_cost = holding["avg_cost"]
-            ax.axhline(avg_cost, linestyle="--", linewidth=1.5, alpha=0.72, color="#64748b", label=f"avg cost ${avg_cost:.2f}")
-
-        for trade in TRADES:
-            if trade["symbol"] != name or trade["date"] not in history[name]:
-                continue
-            marker = "^" if trade["side"] == "buy" else "v"
-            color = "#15803d" if trade["side"] == "buy" else "#b91c1c"
-            y_value = trade.get("price", history[name][trade["date"]])
-            ax.scatter([trade["date"]], [y_value], marker=marker, s=95, color=color, zorder=5)
-            ax.annotate(
-                f"{trade['side'].upper()} {trade['shares']:g} @${y_value:.2f}",
-                xy=(trade["date"], y_value),
-                xytext=(0, 12 if trade["side"] == "buy" else -18),
-                textcoords="offset points",
-                ha="center",
-                fontsize=8,
-                color=color,
-            )
-
-        ax.set_title(name, loc="left", fontweight="bold")
-        ax.set_ylabel("USD")
-        ax.grid(alpha=0.22)
-        ax.legend(frameon=False, loc="upper left", ncol=2)
-
-    axes[-1].tick_params(axis="x", rotation=45)
-    for label in axes[-1].get_xticklabels():
-        label.set_horizontalalignment("right")
-    fig.suptitle("ETF prices with buy points and cost basis", y=0.995)
-    fig.tight_layout()
-    fig.savefig(output, bbox_inches="tight")
-    plt.close(fig)
-
-
-def generate_charts(history, pf, chart_dir):
-    if chart_dir.exists():
-        shutil.rmtree(chart_dir)
-    chart_dir.mkdir(parents=True, exist_ok=True)
-    save_etf_chart(history, chart_dir / "etfs.png")
 
 def esc(value):
     return html.escape(str(value))
@@ -344,24 +289,22 @@ def history_links():
 
 
 def render_html(report_date, quotes, pf, analysis, report_path):
-    chart_prefix = f"assets/{report_date}"
     actions = analysis["today_actions"]
     holdings = "".join(holding_html(symbol, quotes[symbol], pf["holdings"][symbol], analysis["etf_judgements"][symbol]) for symbol in HOLDINGS)
     priorities = "".join(f"<li><b>{symbol}</b>：{esc(analysis['next_priorities'][symbol])}</li>" for symbol in ["VOO", "QQQ", "VXUS"])
     action_items = "".join(f"<li><b>{label}</b>：{esc(actions[key])}</li>" for key, label in [("VOO", "VOO"), ("VXUS", "VXUS"), ("QQQ", "QQQ"), ("new_funds", "新资金"), ("take_profit", "止盈提醒")])
     metrics = "".join(f'<div class="metric">{name}<b>{fmt_price(quotes[name]["close"])}</b><span>{fmt_pct(quotes[name]["change_pct"])}</span></div>' for name in ["标普500", "道指", "纳指"])
     ai_metrics = "".join(f'<div class="metric">{name}<b>{fmt_price(quotes[name]["close"])}</b><span>{fmt_pct(quotes[name]["change_pct"])}</span></div>' for name in ["NVDA", "QQQ"])
-    charts = f'<figure class="wide-chart"><img src="{chart_prefix}/etfs.png" alt="ETF 走势与成本线"></figure>'
     page = f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>美股情报简报｜{report_date}</title><style>
 :root{{--ink:#172033;--muted:#64748b;--line:#e2e8f0;--soft:#f6f8fb;--blue:#1769aa;--green:#15803d}}*{{box-sizing:border-box}}
 body{{margin:0;background:#f3f6f9;color:var(--ink);font:15px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif}}
 main{{max-width:1080px;margin:auto;background:white;min-height:100vh;padding:28px}}h1{{margin:0;font-size:28px}}h2{{margin:28px 0 12px;border-bottom:1px solid var(--line);padding-bottom:8px;font-size:20px}}
-.meta{{color:var(--muted)}}.metrics,.holdings,.charts{{display:grid;gap:14px}}.metrics{{grid-template-columns:repeat(3,1fr)}}.holdings{{grid-template-columns:repeat(3,1fr)}}
+.meta{{color:var(--muted)}}.metrics,.holdings{{display:grid;gap:14px}}.metrics{{grid-template-columns:repeat(3,1fr)}}.holdings{{grid-template-columns:repeat(3,1fr)}}
 .metric,.holding,.note{{border:1px solid var(--line);border-radius:6px;padding:14px;background:#fff}}.metric b{{display:block;font-size:21px}}h3{{margin:0 0 9px}}h3 span{{float:right;color:var(--blue)}}
-dl{{display:grid;grid-template-columns:auto 1fr;gap:2px 10px;margin:0}}dt{{color:var(--muted)}}dd{{margin:0;text-align:right}}.charts{{grid-template-columns:1fr}}figure{{margin:0;border:1px solid var(--line);padding:9px;border-radius:6px}}img{{width:100%;height:auto;display:block}}
+dl{{display:grid;grid-template-columns:auto 1fr;gap:2px 10px;margin:0}}dt{{color:var(--muted)}}dd{{margin:0;text-align:right}}
 .signal{{border-left:4px solid var(--green);background:#f0fdf4;padding:12px 15px}}.history a{{display:inline-block;margin:0 9px 7px 0}}ul{{padding-left:20px}}
-@media(max-width:760px){{main{{padding:18px}}h1{{font-size:23px}}.metrics,.holdings,.charts{{grid-template-columns:1fr}}}}
+@media(max-width:760px){{main{{padding:18px}}h1{{font-size:23px}}.metrics,.holdings{{grid-template-columns:1fr}}}}
 </style></head><body><main><header><h1>美股情报简报</h1><div class="meta">{report_date}｜昨晚收盘</div></header>
 <h2>大盘</h2><div class="metrics">{metrics}</div><p>{esc(analysis["market_conclusion"])}</p>
 <h2>AI</h2><div class="metrics">{ai_metrics}</div><p>{esc(analysis["ai_conclusion"])}</p>
@@ -370,7 +313,6 @@ dl{{display:grid;grid-template-columns:auto 1fr;gap:2px 10px;margin:0}}dt{{color
 <h2>资金配置提醒</h2><div class="metrics"><div class="metric">目标组合<b>VOO 60%</b><span>QQQ 25% / VXUS 15%</span></div><div class="metric">当前已投入<b>${pf["invested"]:.2f}</b><span>计划总资金 $3000</span></div><div class="metric">组合浮盈亏<b>{fmt_usd(pf["total_pnl"])}</b><span>当前市值 ${pf["market_value"]:.2f}</span></div></div>
 <p class="signal"><b>当前强买入信号：</b>{esc(analysis["strong_buy_signal"])}<br><b>当前可执行信号：</b>{esc(analysis["executable_signal"])}</p>
 <h2>下一笔优先级</h2><ol>{priorities}</ol><h2>今日动作</h2><ul>{action_items}</ul>
-<h2>ETF 走势与成本线</h2><div class="charts">{charts}</div>
 <h2>历史日报</h2><nav class="history">{history_links()}</nav></main></body></html>'''
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(page, encoding="utf-8")
@@ -446,8 +388,6 @@ def build_report(force=False):
     report_date = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
     pf = portfolio(quotes)
     analysis = generate_analysis(quotes, fetch_news(), pf)
-    chart_dir = DOCS_DIR / "assets" / report_date
-    generate_charts(history, pf, chart_dir)
     cleanup_history(date.fromisoformat(report_date))
     render_html(report_date, quotes, pf, analysis, DOCS_DIR / "reports" / f"{report_date}.html")
     write_pending(summary_card(report_date, analysis, f"{BASE_URL}/reports/{report_date}.html"))
