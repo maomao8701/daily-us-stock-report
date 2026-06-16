@@ -43,6 +43,20 @@ CHART_LABELS = {"标普500": "S&P 500", "道指": "Dow", "纳指": "Nasdaq", "NV
 BASE_URL = "https://maomao8701.github.io/daily-us-stock-report"
 DOCS_DIR = Path("docs")
 PENDING_MESSAGE = Path(".pending-feishu-message.json")
+MARKET_HOLIDAYS = {
+    2026: {
+        "2026-01-01",
+        "2026-01-19",
+        "2026-02-16",
+        "2026-04-03",
+        "2026-05-25",
+        "2026-06-19",
+        "2026-07-03",
+        "2026-09-07",
+        "2026-11-26",
+        "2026-12-25",
+    }
+}
 REPORT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -140,17 +154,28 @@ def fetch_market_data():
     return quotes, history
 
 
+def expected_market_date(now):
+    today = now.date()
+    expected = today - timedelta(days=1)
+    if expected.weekday() >= 5:
+        return None
+    if expected.isoformat() in MARKET_HOLIDAYS.get(expected.year, set()):
+        return None
+    return expected.isoformat()
+
+
 def market_status_message(quotes, now=None):
     now = now or datetime.now(ZoneInfo("Asia/Shanghai"))
     today = now.date()
-    if now.weekday() not in [1, 2, 3, 4, 5]:
+    expected = expected_market_date(now)
+    if not expected:
         return f"【美股情报简报｜{today.isoformat()}｜美股休市】\n\n昨晚美股休市，没有新的收盘数据。"
-    expected = (today - timedelta(days=1)).isoformat()
     latest = quotes["标普500"]["last_date"]
     if latest != expected:
         return (
-            f"【美股情报简报｜{today.isoformat()}｜美股休市】\n\n"
-            f"昨晚美股休市，或收盘数据尚未更新。当前最新收盘日期：{latest}。"
+            f"【美股情报简报｜{today.isoformat()}｜行情数据未更新】\n\n"
+            f"昨晚美股应为正常交易日，但当前行情源最新收盘日期仍是 {latest}，预期应为 {expected}。\n"
+            "今日暂不生成完整日报，避免使用过期行情。请稍后手动重跑，或等待下一次自动更新。"
         )
     return None
 
