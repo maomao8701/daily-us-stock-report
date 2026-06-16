@@ -1,6 +1,7 @@
 import argparse
 import html
 import json
+import math
 import os
 import shutil
 import sys
@@ -125,6 +126,23 @@ def fmt_usd(value):
     return f"{value:+.2f}美元"
 
 
+def is_missing_number(value):
+    try:
+        return value is None or math.isnan(float(value))
+    except (TypeError, ValueError):
+        return True
+
+
+def latest_market_price(symbol):
+    try:
+        price = yf.Ticker(symbol).fast_info.last_price
+    except Exception:
+        return None
+    if is_missing_number(price):
+        return None
+    return float(price)
+
+
 def fetch_market_data():
     raw = yf.download(
         list(TICKERS.values()),
@@ -138,10 +156,17 @@ def fetch_market_data():
     quotes = {}
     history = {}
     for name, symbol in TICKERS.items():
-        frame = raw[symbol].dropna(subset=["Close"])
-        if len(frame) < 2:
+        frame = raw[symbol].copy()
+        if frame.empty:
             raise RuntimeError(f"{symbol} 可用收盘数据不足")
-        closes = frame["Close"]
+        closes = frame["Close"].copy()
+        if is_missing_number(closes.iloc[-1]):
+            fallback_price = latest_market_price(symbol)
+            if fallback_price is not None:
+                closes.iloc[-1] = fallback_price
+        closes = closes.dropna()
+        if len(closes) < 2:
+            raise RuntimeError(f"{symbol} 可用收盘数据不足")
         latest = float(closes.iloc[-1])
         previous = float(closes.iloc[-2])
         quotes[name] = {
