@@ -147,7 +147,7 @@ def fetch_market_data():
         group_by="ticker",
         progress=False,
         auto_adjust=False,
-        threads=True,
+        threads=False,
     )
     quotes = {}
     history = {}
@@ -185,12 +185,17 @@ def expected_market_date(now):
     return expected.isoformat()
 
 
+def market_closed_message(now):
+    today = now.date()
+    return f"【美股情报简报｜{today.isoformat()}｜美股休市】\n\n昨晚美股休市，没有新的收盘数据。"
+
+
 def market_status_message(quotes, now=None):
     now = now or datetime.now(ZoneInfo("Asia/Shanghai"))
     today = now.date()
     expected = expected_market_date(now)
     if not expected:
-        return f"【美股情报简报｜{today.isoformat()}｜美股休市】\n\n昨晚美股休市，没有新的收盘数据。"
+        return market_closed_message(now)
     latest = quotes["标普500"]["last_date"]
     if latest != expected:
         return (
@@ -374,19 +379,28 @@ def send_pending():
         send_feishu({"msg_type": "text", "content": {"text": f"{title}\n\n{content}\n\n完整报告：{url}"}})
 
 
+def write_status_message(message):
+    DOCS_DIR.mkdir(parents=True, exist_ok=True)
+    index = DOCS_DIR / "index.html"
+    if not index.exists():
+        index.write_text('<!doctype html><meta charset="utf-8"><title>美股情报简报</title><body><h1>美股情报简报</h1><p>暂无交易日报，下一次正常交易日收盘后更新。</p></body>', encoding="utf-8")
+        (DOCS_DIR / ".nojekyll").touch()
+    print(message)
+    write_pending({"msg_type": "text", "content": {"text": message}})
+
+
 def build_report(force=False):
-    quotes, history = fetch_market_data()
-    holiday = None if force else market_status_message(quotes)
-    if holiday:
-        DOCS_DIR.mkdir(parents=True, exist_ok=True)
-        index = DOCS_DIR / "index.html"
-        if not index.exists():
-            index.write_text("<!doctype html><meta charset=\"utf-8\"><title>美股情报简报</title><body><h1>美股情报简报</h1><p>暂无交易日报，下一次正常交易日收盘后更新。</p></body>", encoding="utf-8")
-            (DOCS_DIR / ".nojekyll").touch()
-        print(holiday)
-        write_pending({"msg_type": "text", "content": {"text": holiday}})
+    now = datetime.now(ZoneInfo("Asia/Shanghai"))
+    if not force and expected_market_date(now) is None:
+        write_status_message(market_closed_message(now))
         return
-    report_date = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
+
+    quotes, history = fetch_market_data()
+    status_message = None if force else market_status_message(quotes, now)
+    if status_message:
+        write_status_message(status_message)
+        return
+    report_date = now.date().isoformat()
     pf = portfolio(quotes)
     analysis = generate_analysis(quotes, fetch_news(), pf)
     cleanup_history(date.fromisoformat(report_date))
