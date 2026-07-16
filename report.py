@@ -25,9 +25,9 @@ TICKERS = {
     "VXUS": "VXUS",
 }
 HOLDINGS = {
-    "VOO": {"shares": 0.4, "avg_cost": 648.57},
-    "VXUS": {"shares": 3.0, "avg_cost": 83.11},
-    "QQQ": {"shares": 0.04, "avg_cost": 745.25},
+    "VOO": {"shares": 0.4, "avg_cost": 650.3214875},
+    "VXUS": {"shares": 3.0, "avg_cost": 83.228455333},
+    "QQQ": {"shares": 0.6, "avg_cost": 722.412286667},
 }
 TARGET_VALUES = {"VOO": 1800, "QQQ": 750, "VXUS": 450}
 TRADES = [
@@ -35,6 +35,7 @@ TRADES = [
     {"date": "2026-05-05", "symbol": "VOO", "side": "buy", "shares": 0.30, "price": 663.54},
     {"date": "2026-05-05", "symbol": "VXUS", "side": "buy", "shares": 3.00, "price": 83.11},
     {"date": "2026-06-16", "symbol": "QQQ", "side": "buy", "shares": 0.04, "price": 737.94, "commission": 0.30, "basis": 29.81},
+    {"date": "2026-07-15", "symbol": "QQQ", "side": "buy", "shares": 0.56, "price": 720.15, "commission": 0.35, "basis": 403.63},
 ]
 CHART_LABELS = {"标普500": "S&P 500", "道指": "Dow", "纳指": "Nasdaq", "NVDA": "NVDA", "QQQ": "QQQ", "VOO": "VOO", "VXUS": "VXUS"}
 BASE_URL = "https://maomao8701.github.io/daily-us-stock-report"
